@@ -1,0 +1,14 @@
+{
+  "name": "dev-dashboard",
+  "description": "Claude の稼働状況と GitHub への最近のプッシュを横のパネルに並べる、Claude Code 用の mod",
+  "owner": {
+    "name": "たぬ"
+  },
+  "plugins": [
+    {
+      "name": "dev-dashboard",
+      "source": "./plugins/dev-dashboard",
+      "description": "セッションの横に、Claude の稼働状況・最近のプッシュ（コミットメッセージ付き）・プッシュ待ちのリポジトリを出すダッシュボード"
+    }
+  ]
+}
