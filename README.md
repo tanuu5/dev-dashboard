@@ -32,7 +32,7 @@ Claude Code のアプリを開くと、画面の右側がけっこう空いて�
 
 ## インストール
 
-**動作環境**：Claude Code のデスクトップアプリ（Code タブ）。mod の仕組み（function hooks）が入った版が必要です。作者は macOS 版のデスクトップアプリ（Claude Code 2.1.286）で確かめました。「最近のプッシュ」には [GitHub CLI](https://cli.github.com/)（`gh`）にログインしていることが必要です。
+**動作環境**：Claude Code のデスクトップアプリ（Code タブ）。mod の仕組み（function hooks）が入った版が必要です。作者は macOS 版のデスクトップアプリ 2.19675.0（中に入っている Claude Code は 2.1.286）で確かめました。「最近のプッシュ」には [GitHub CLI](https://cli.github.com/)（`gh`）にログインしていることが必要です。
 
 ターミナルで次の 2 行を実行します。
 
