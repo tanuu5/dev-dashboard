@@ -1,1 +1,9 @@
-{ "name": "dev-dashboard", "version": "0.1.0", "description": "Pane showing Claude service status, unpushed local repos, recent commits and GitHub pushes", "types": "./types/index.d.ts" }
+{
+  "name": "dev-dashboard",
+  "version": "0.2.0",
+  "description": "Pane showing Claude service status, unpushed local repos, recent commits and GitHub pushes",
+  "author": {
+    "name": "たぬ"
+  },
+  "types": "./types/index.d.ts"
+}

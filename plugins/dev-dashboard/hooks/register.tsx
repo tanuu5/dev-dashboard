@@ -121,17 +121,84 @@ async function pushDetail($: Api, repo: string, before: string, head: string): P
   return { count: n, messages: (m as string[]).reverse() }
 }
 
+// ---- イベント API の遅れを補う ----
+// users/<login>/events は反映が数十秒〜数時間遅れることがあり、直前のプッシュが出てこない。
+// リポジトリの pushed_at はすぐ変わるので、それが最新のイベントより新しいリポジトリは、
+// 既定のブランチのコミットを新しい順に読み、イベントに載っている先頭（payload.head）の手前までを 1 回のプッシュとして足す。
+const LAG_REPOS = 10
+// イベントの遅れはこれ以内。これより古いプッシュはイベントに載っているはず
+const LAG_WINDOW_MS = 6 * 60 * 60 * 1000
+// pushed_at とイベントの時刻のずれの許し
+const LAG_SLACK_MS = 30 * 1000
+
+type RepoPushed = { name: string; pushedAt: string; branch: string }
+type CommitLine = { sha: string; date: string; message: string }
+
+// イベントにまだ載っていないコミット（新しい順）。イベントに載っている先頭まで来たら止める
+export function unreportedCommits(commits: readonly CommitLine[], reportedHead: string | undefined, pushedAt: number): CommitLine[] {
+  const fresh: CommitLine[] = []
+  for (const c of commits) {
+    if (c.sha === reportedHead) break
+    // そのリポジトリのイベントが一つも無いときは、遅れの幅より古いコミットまでは遡らない
+    if (reportedHead === undefined && Date.parse(c.date) < pushedAt - LAG_WINDOW_MS) break
+    fresh.push(c)
+  }
+  return fresh
+}
+
+async function collectLaggingPushes($: Api, pushEvents: readonly any[], now: number): Promise<Push[]> {
+  const out = await gh($, [
+    'api',
+    `user/repos?sort=pushed&per_page=${LAG_REPOS}`,
+    '--jq',
+    '[.[] | {name: .full_name, pushedAt: .pushed_at, branch: .default_branch}]',
+  ])
+  if (out === null) return []
+  const latest = new Map<string, any>()
+  for (const ev of pushEvents) {
+    const cur = latest.get(ev.repo.name)
+    if (!cur || Date.parse(ev.created_at) > Date.parse(cur.created_at)) latest.set(ev.repo.name, ev)
+  }
+  const pushes = await Promise.all(
+    (JSON.parse(out) as RepoPushed[]).map(async (repo): Promise<Push | null> => {
+      const pushedAt = Date.parse(repo.pushedAt)
+      const ev = latest.get(repo.name)
+      if (now - pushedAt > LAG_WINDOW_MS) return null
+      if (ev && Date.parse(ev.created_at) >= pushedAt - LAG_SLACK_MS) return null
+      const commitsOut = await gh($, [
+        'api',
+        `repos/${repo.name}/commits?sha=${encodeURIComponent(repo.branch)}&per_page=10`,
+        '--jq',
+        '[.[] | {sha, date: .commit.committer.date, message: (.commit.message | split("\n")[0])}]',
+      ])
+      if (commitsOut === null) return null
+      const fresh = unreportedCommits(JSON.parse(commitsOut) as CommitLine[], ev?.payload?.head, pushedAt)
+      if (fresh.length === 0) return null
+      return {
+        id: `${repo.name}@${repo.pushedAt}`,
+        repo: repo.name,
+        time: pushedAt,
+        branch: repo.branch,
+        count: fresh.length,
+        messages: fresh.map(c => c.message),
+      }
+    }),
+  )
+  return pushes.filter(p => p !== null)
+}
+
 async function collectPushes($: Api): Promise<Push[]> {
   const login = (await gh($, ['api', 'user', '--jq', '.login']))?.trim()
   if (!login) throw new Error('gh にログインしていないか、gh が見つからない')
   const out = await gh($, ['api', `users/${login}/events?per_page=100`])
   if (out === null) throw new Error('GitHub のイベントを取得できず')
-  const events = (JSON.parse(out) as any[])
-    .filter(ev => ev.type === 'PushEvent')
+  const pushEvents = (JSON.parse(out) as any[]).filter(ev => ev.type === 'PushEvent')
+  const lagging = await collectLaggingPushes($, pushEvents, Date.now()).catch(() => [] as Push[])
+  const events = [...pushEvents]
     // イベントの並びは時刻順とは限らない（ID 順で、反映が遅れたものが前後する）ので並べ直す
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
     .slice(0, PUSH_COUNT)
-  return Promise.all(
+  const fromEvents = await Promise.all(
     events.map(async (ev): Promise<Push> => {
       const id = String(ev.payload.push_id ?? ev.id)
       let detail = pushDetails.get(id)
@@ -152,6 +219,7 @@ async function collectPushes($: Api): Promise<Push[]> {
       }
     }),
   )
+  return [...lagging, ...fromEvents].sort((a, b) => b.time - a.time).slice(0, PUSH_COUNT)
 }
 
 async function openPane($: Api) {
