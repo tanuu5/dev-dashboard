@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { unreportedCommits } from '../hooks/register'
+import { readmeTitle, sections, unreportedCommits } from '../hooks/register'
 
 const commit = (sha: string, date: string) => ({ sha, date, message: `msg ${sha}` })
 
@@ -17,5 +17,46 @@ describe('イベントにまだ載っていないプッシュを補う', () => {
 
   test('先頭がもう載っていれば何も足さない', async () => {
     expect(unreportedCommits([commit('c1', '2026-10-03T03:16:00Z')], 'c1', Date.parse('2026-10-03T03:16:33Z'))).toEqual([])
+  })
+})
+
+describe('README の見出しを名前に添える', () => {
+  test('日本語名が入った見出しを拾う', async () => {
+    expect(readmeTitle('# しっぽ急便 — TAIL EXPRESS\n\n本文', 'shippo-express')).toBe('しっぽ急便 — TAIL EXPRESS')
+    expect(readmeTitle('<div align="center">\n<h1>怪獣ドカン！</h1>\n</div>', 'kaiju-dokan')).toBe('怪獣ドカン！')
+    expect(readmeTitle('[![badge](https://x)](https://y)\n# [ぶんべつビート](https://z) — Bunbetsu Beat', 'bunbetsu-beat')).toBe('ぶんべつビート — Bunbetsu Beat')
+  })
+
+  test('リポジトリ名と同じ見出しや、見出しが無い README は添えない', async () => {
+    expect(readmeTitle('# clawd-dance', 'clawd-dance')).toBeNull()
+    expect(readmeTitle('# TANUKI RUSH 🍃', 'tanuki-rush')).toBeNull()
+    expect(readmeTitle('本文だけ', 'x')).toBeNull()
+  })
+})
+
+describe('畳めるセクション', () => {
+  const dashboard = {
+    updatedAt: 0,
+    status: { indicator: 'none', description: 'All Systems Operational', components: [], incidents: [] },
+    repos: [],
+    pushes: [],
+    repoList: [
+      { fullName: 'tanuu5/shippo-express', url: 'https://github.com/tanuu5/shippo-express', pushedAt: 0, isPrivate: false, isArchived: false, title: 'しっぽ急便 — TAIL EXPRESS' },
+      { fullName: 'tanuu5/reel', url: 'https://github.com/tanuu5/reel', pushedAt: 0, isPrivate: true, isArchived: false, title: null },
+    ],
+    errors: [],
+  }
+
+  test('稼働状況・最近のプッシュ・リポジトリの順に並び、プッシュ待ちが無ければ出さない', async () => {
+    const list = sections(dashboard)
+    expect(list.map(s => s.id)).toEqual(['status', 'pushes', 'repos'])
+    expect(list[0]!.title).toBe('Claude の稼働状況　🟢')
+    expect(list[2]!.title).toBe('リポジトリ（2）')
+  })
+
+  test('リポジトリは GitHub へのリンクと日本語名、非公開の印を出す', async () => {
+    const md = sections(dashboard)[2]!.markdown
+    expect(md).toContain('[**shippo-express**](https://github.com/tanuu5/shippo-express)　しっぽ急便 — TAIL EXPRESS')
+    expect(md).toContain('[**reel**](https://github.com/tanuu5/reel)　🔒')
   })
 })

@@ -1,6 +1,6 @@
 {
   "name": "dev-dashboard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pane showing Claude service status, unpushed local repos, recent commits and GitHub pushes",
   "author": {
     "name": "たぬ"

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Dashboard, Push, RepoState, ServiceStatus } from '../types'
+import type { Dashboard, Push, RepoInfo, RepoState, ServiceStatus } from '../types'
 
 // Claude Code のホーム画面には描けないので、セッションの横にダッシュボードのパネルを出す。
 // 中身：Claude の稼働状況（status.claude.com）、GitHub への最近のプッシュ（コミットメッセージ付き）、
@@ -11,12 +11,15 @@ const PANE = 'dev-dashboard'
 const TITLE = 'ダッシュボード'
 const REFRESH_MS = 5 * 60 * 1000
 const SHOW_COMPONENTS = ['claude.ai', 'Claude API', 'Claude Code']
-const PUSH_COUNT = 15
+const PUSH_COUNT = 10
 const MESSAGES_PER_PUSH = 3
 
 const data = atom({ plugin: 'dev-dashboard', key: 'data' } as const, null)
 const isLoading = atom({ plugin: 'dev-dashboard', key: 'isLoading' } as const, false)
 const isOpen = atom({ plugin: 'dev-dashboard', key: 'isOpen' } as const, false)
+// 畳んでいるセクションの id。$.store にも置き、次のセッションでも同じ畳み方にする
+const collapsed = atom({ plugin: 'dev-dashboard', key: 'collapsed' } as const, [])
+const COLLAPSED_KEY = 'collapsed'
 
 type Api = EngineInterface
 
@@ -131,7 +134,19 @@ const LAG_WINDOW_MS = 6 * 60 * 60 * 1000
 // pushed_at とイベントの時刻のずれの許し
 const LAG_SLACK_MS = 30 * 1000
 
-type RepoPushed = { name: string; pushedAt: string; branch: string }
+// GitHub の自分のリポジトリ（最後にプッシュした順）。プッシュの補いとリポジトリの欄の両方で使う
+type RepoPushed = { name: string; pushedAt: string; branch: string; url: string; isPrivate: boolean; isArchived: boolean }
+
+async function fetchOwnRepos($: Api): Promise<RepoPushed[]> {
+  const out = await gh($, [
+    'api',
+    'user/repos?affiliation=owner&sort=pushed&per_page=100',
+    '--jq',
+    '[.[] | {name: .full_name, pushedAt: .pushed_at, branch: .default_branch, url: .html_url, isPrivate: .private, isArchived: .archived}]',
+  ])
+  if (out === null) throw new Error('リポジトリの一覧を取得できず')
+  return JSON.parse(out) as RepoPushed[]
+}
 type CommitLine = { sha: string; date: string; message: string }
 
 // イベントにまだ載っていないコミット（新しい順）。イベントに載っている先頭まで来たら止める
@@ -146,21 +161,14 @@ export function unreportedCommits(commits: readonly CommitLine[], reportedHead: 
   return fresh
 }
 
-async function collectLaggingPushes($: Api, pushEvents: readonly any[], now: number): Promise<Push[]> {
-  const out = await gh($, [
-    'api',
-    `user/repos?sort=pushed&per_page=${LAG_REPOS}`,
-    '--jq',
-    '[.[] | {name: .full_name, pushedAt: .pushed_at, branch: .default_branch}]',
-  ])
-  if (out === null) return []
+async function collectLaggingPushes($: Api, pushEvents: readonly any[], now: number, ownRepos: readonly RepoPushed[]): Promise<Push[]> {
   const latest = new Map<string, any>()
   for (const ev of pushEvents) {
     const cur = latest.get(ev.repo.name)
     if (!cur || Date.parse(ev.created_at) > Date.parse(cur.created_at)) latest.set(ev.repo.name, ev)
   }
   const pushes = await Promise.all(
-    (JSON.parse(out) as RepoPushed[]).map(async (repo): Promise<Push | null> => {
+    ownRepos.slice(0, LAG_REPOS).map(async (repo): Promise<Push | null> => {
       const pushedAt = Date.parse(repo.pushedAt)
       const ev = latest.get(repo.name)
       if (now - pushedAt > LAG_WINDOW_MS) return null
@@ -187,13 +195,13 @@ async function collectLaggingPushes($: Api, pushEvents: readonly any[], now: num
   return pushes.filter(p => p !== null)
 }
 
-async function collectPushes($: Api): Promise<Push[]> {
+async function collectPushes($: Api, ownRepos: readonly RepoPushed[]): Promise<Push[]> {
   const login = (await gh($, ['api', 'user', '--jq', '.login']))?.trim()
   if (!login) throw new Error('gh にログインしていないか、gh が見つからない')
   const out = await gh($, ['api', `users/${login}/events?per_page=100`])
   if (out === null) throw new Error('GitHub のイベントを取得できず')
   const pushEvents = (JSON.parse(out) as any[]).filter(ev => ev.type === 'PushEvent')
-  const lagging = await collectLaggingPushes($, pushEvents, Date.now()).catch(() => [] as Push[])
+  const lagging = await collectLaggingPushes($, pushEvents, Date.now(), ownRepos).catch(() => [] as Push[])
   const events = [...pushEvents]
     // イベントの並びは時刻順とは限らない（ID 順で、反映が遅れたものが前後する）ので並べ直す
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
@@ -222,6 +230,65 @@ async function collectPushes($: Api): Promise<Push[]> {
   return [...lagging, ...fromEvents].sort((a, b) => b.time - a.time).slice(0, PUSH_COUNT)
 }
 
+// ---- リポジトリの欄 ----
+// 名前のほかに、README の最初の見出しを添える（「しっぽ急便 — TAIL EXPRESS」のように日本語名が入っていることが多い）。
+// README はプッシュしないと変わらないので、pushed_at ごとに $.store に覚え、変わったリポジトリだけ読み直す。
+const TITLES_KEY = 'readmeTitles'
+const TITLE_FETCH_PARALLEL = 6
+type TitleCache = Record<string, { pushedAt: string; title: string | null }>
+
+// 文字と数字だけを残して比べる（日本語は残す。絵文字・記号・空白・大小は無視）
+const normalize = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+
+// README の最初の見出し（# か <h1>）。リポジトリ名と同じ（記号・大小を除いて）なら添えない
+export function readmeTitle(readme: string, repoName: string): string | null {
+  let raw: string | undefined
+  for (const line of readme.split('\n').slice(0, 40)) {
+    raw = /^#\s+(.+)$/.exec(line.trim())?.[1] ?? /<h1[^>]*>(.*?)<\/h1>/i.exec(line)?.[1]
+    if (raw !== undefined) break
+  }
+  if (raw === undefined) return null
+  const title = raw
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/<[^>]+>/g, '')
+    .replace(/[*_`]/g, '')
+    .trim()
+  if (title === '' || normalize(title) === normalize(repoName)) return null
+  return title
+}
+
+async function collectRepoList($: Api, ownRepos: readonly RepoPushed[]): Promise<RepoInfo[]> {
+  const cache = ((await $.store.get(TITLES_KEY)) ?? {}) as TitleCache
+  const stale = ownRepos.filter(r => cache[r.name]?.pushedAt !== r.pushedAt)
+  for (let i = 0; i < stale.length; i += TITLE_FETCH_PARALLEL) {
+    await Promise.all(
+      stale.slice(i, i + TITLE_FETCH_PARALLEL).map(async repo => {
+        const readme = await gh($, ['api', `repos/${repo.name}/readme`, '-H', 'Accept: application/vnd.github.raw'])
+        cache[repo.name] = { pushedAt: repo.pushedAt, title: readme === null ? null : readmeTitle(readme, repo.name.split('/').pop() ?? repo.name) }
+      }),
+    )
+  }
+  if (stale.length > 0) {
+    const kept: TitleCache = {}
+    for (const r of ownRepos) if (cache[r.name]) kept[r.name] = cache[r.name]!
+    await $.store.set(TITLES_KEY, kept)
+  }
+  return ownRepos.map(r => ({
+    fullName: r.name,
+    url: r.url,
+    pushedAt: Date.parse(r.pushedAt),
+    isPrivate: r.isPrivate,
+    isArchived: r.isArchived,
+    title: cache[r.name]?.title ?? null,
+  }))
+}
+
+async function toggleSection($: Api, id: string) {
+  const next = await update($, collapsed, list => (list.includes(id) ? list.filter(x => x !== id) : [...list, id]))
+  await $.store.set(COLLAPSED_KEY, next)
+}
+
 async function openPane($: Api) {
   await update($, isOpen, () => true)
   await $.ui.open({ id: PANE, title: TITLE })
@@ -240,12 +307,14 @@ async function refresh($: Api) {
 
 async function collectAll($: Api) {
   const errors: string[] = []
-  const [status, repos, pushes] = await Promise.all([
+  const ownRepos = await fetchOwnRepos($).catch(err => (errors.push(`GitHub：${err.message ?? err}`), [] as RepoPushed[]))
+  const [status, repos, pushes, repoList] = await Promise.all([
     collectStatus($).catch(err => (errors.push(`稼働状況：${err.message ?? err}`), null)),
     collectRepos($).catch(err => (errors.push(`ローカル：${err.message ?? err}`), [] as RepoState[])),
-    collectPushes($).catch(err => (errors.push(`GitHub：${err.message ?? err}`), [] as Push[])),
+    collectPushes($, ownRepos).catch(err => (errors.push(`GitHub：${err.message ?? err}`), [] as Push[])),
+    collectRepoList($, ownRepos).catch(err => (errors.push(`README：${err.message ?? err}`), [] as RepoInfo[])),
   ])
-  const next: Dashboard = { updatedAt: Date.now(), status, repos, pushes, errors }
+  const next: Dashboard = { updatedAt: Date.now(), status, repos, pushes, repoList, errors }
   await update($, data, () => next)
 }
 
@@ -271,12 +340,15 @@ function esc(s: string) {
   return s.replace(/([\\`*_[\]|<>])/g, '\\$1')
 }
 
-function toMarkdown(d: Dashboard) {
-  const out: string[] = []
+// 畳めるセクション。見出しはボタン（▼／▶）、中身は Markdown
+type Section = { id: string; title: string; markdown: string }
 
-  out.push('### Claude の稼働状況')
-  if (d.status) {
-    const s = d.status
+const limit = (text: string) => text.slice(0, 9800)
+
+function statusSection(d: Dashboard): Section {
+  const out: string[] = []
+  const s = d.status
+  if (s) {
     out.push(`${INDICATOR[s.indicator] ?? '⚪'} **${esc(s.description)}**`)
     out.push('')
     out.push(s.components.map(c => `${MARK[c.status] ?? '⚪'} ${esc(c.name)}`).join('　'))
@@ -289,25 +361,31 @@ function toMarkdown(d: Dashboard) {
   } else {
     out.push('取得できませんでした')
   }
+  // 畳んでいても状態が分かるよう、見出しに印を付ける
+  return { id: 'status', title: `Claude の稼働状況　${s ? (INDICATOR[s.indicator] ?? '⚪') : '⚪'}`, markdown: limit(out.join('\n')) }
+}
 
-  // 個人開発ではコミットとプッシュがほぼセットなので、プッシュ待ちはあるときだけ出す
+// 個人開発ではコミットとプッシュがほぼセットなので、プッシュ待ちはあるときだけ出す
+function pendingSection(d: Dashboard): Section | null {
   const pending = d.repos
     .filter(r => r.ahead > 0 || r.dirty > 0 || (r.hasRemote && !r.hasUpstream))
     .sort((a, b) => b.ahead - a.ahead || b.dirty - a.dirty)
-  if (pending.length > 0) {
-    out.push('', '### プッシュ待ち・未コミット')
-    for (const r of pending.slice(0, 8)) {
-      const tags = [
-        r.ahead > 0 ? `⬆ ${r.ahead} 件未プッシュ` : '',
-        r.behind > 0 ? `⬇ ${r.behind}` : '',
-        r.dirty > 0 ? `✎ ${r.dirty} ファイル未コミット` : '',
-        r.hasRemote && !r.hasUpstream ? '上流ブランチなし' : '',
-      ].filter(Boolean)
-      out.push(`- **${esc(r.name)}** \`${esc(r.branch)}\`　${tags.join('・')}`)
-    }
+  if (pending.length === 0) return null
+  const out: string[] = []
+  for (const r of pending.slice(0, 8)) {
+    const tags = [
+      r.ahead > 0 ? `⬆ ${r.ahead} 件未プッシュ` : '',
+      r.behind > 0 ? `⬇ ${r.behind}` : '',
+      r.dirty > 0 ? `✎ ${r.dirty} ファイル未コミット` : '',
+      r.hasRemote && !r.hasUpstream ? '上流ブランチなし' : '',
+    ].filter(Boolean)
+    out.push(`- **${esc(r.name)}** \`${esc(r.branch)}\`　${tags.join('・')}`)
   }
+  return { id: 'pending', title: `プッシュ待ち・未コミット（${pending.length}）`, markdown: limit(out.join('\n')) }
+}
 
-  out.push('', '### 最近のプッシュ')
+function pushesSection(d: Dashboard): Section {
+  const out: string[] = []
   if (d.pushes.length === 0) out.push('なし')
   for (const p of d.pushes) {
     const repo = p.repo.split('/').pop() ?? p.repo
@@ -317,9 +395,23 @@ function toMarkdown(d: Dashboard) {
     for (const m of p.messages.slice(0, MESSAGES_PER_PUSH)) out.push(`  - ${esc(m)}`)
     if (p.messages.length > MESSAGES_PER_PUSH) out.push(`  - ほか ${p.messages.length - MESSAGES_PER_PUSH} 件`)
   }
+  return { id: 'pushes', title: `最近のプッシュ（${d.pushes.length}）`, markdown: limit(out.join('\n')) }
+}
 
-  if (d.errors.length > 0) out.push('', ...d.errors.map(e => `> ⚠ ${esc(e)}`))
-  return out.join('\n').slice(0, 9800)
+// 自分のリポジトリ全部。最後にプッシュした順。名前を押すと GitHub のページが開く
+function reposSection(d: Dashboard): Section {
+  const out = d.repoList.map(r => {
+    const name = r.fullName.split('/').pop() ?? r.fullName
+    const title = r.title ? `　${esc(r.title)}` : ''
+    const marks = `${r.isPrivate ? '　🔒' : ''}${r.isArchived ? '　📦' : ''}`
+    return `- [**${esc(name)}**](${r.url})${title}${marks}　·　${ago(r.pushedAt)}`
+  })
+  if (out.length === 0) out.push('なし')
+  return { id: 'repos', title: `リポジトリ（${d.repoList.length}）`, markdown: limit(out.join('\n')) }
+}
+
+export function sections(d: Dashboard): Section[] {
+  return [statusSection(d), pendingSection(d), pushesSection(d), reposSection(d)].filter(x => x !== null)
 }
 
 export const register: Register = on => {
@@ -327,6 +419,8 @@ export const register: Register = on => {
     await $.command.register({ name: 'dash', description: 'ダッシュボード（Claude の稼働状況・最近のプッシュ）を開く' })
     // 読み込み直しで更新の途中が切れても止まらないよう、旗を下ろしてから始める
     await update($, isLoading, () => false)
+    const stored = await $.store.get(COLLAPSED_KEY)
+    await update($, collapsed, () => (Array.isArray(stored) ? (stored as string[]) : []))
     void openPane($)
     $.clock.every(REFRESH_MS, () => void refresh($))
     return next(e)
@@ -361,13 +455,28 @@ export const register: Register = on => {
     const { Box, Text, Button, Markdown } = $.ui.resolve(e)
     const d = await read($, data)
     const loading = await read($, isLoading)
+    const folded = await read($, collapsed)
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between">
           <Text dimColor>{loading ? '更新中…' : d ? `${ago(d.updatedAt)}に更新` : ''}</Text>
           <Button label="更新" hotkey="r" onPress={() => void refresh($)} />
         </Box>
-        {d ? <Markdown text={toMarkdown(d)} /> : <Text dimColor>読み込み中…</Text>}
+        {d === null ? <Text dimColor>読み込み中…</Text> : null}
+        {(d === null ? [] : sections(d)).map(sec => (
+          <Box key={sec.id} flexDirection="column" marginTop={1}>
+            <Box key="head" flexDirection="row">
+              <Button
+                key={`toggle-${sec.id}`}
+                label={`${folded.includes(sec.id) ? '▶' : '▼'} ${sec.title}`}
+                plain
+                onPress={() => void toggleSection($, sec.id)}
+              />
+            </Box>
+            {folded.includes(sec.id) ? null : <Markdown key={`md-${sec.id}`} text={sec.markdown} />}
+          </Box>
+        ))}
+        {d !== null && d.errors.length > 0 ? <Markdown key="errors" text={limit(d.errors.map(e => `> ⚠ ${esc(e)}`).join('\n'))} /> : null}
       </Box>
     )
   })
