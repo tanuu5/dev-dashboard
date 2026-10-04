@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Dashboard, Push, RepoInfo, RepoState, ServiceStatus } from '../types'
+import type { Dashboard, MemoryFile, Push, RepoInfo, RepoState, ServiceStatus } from '../types'
 
 // Claude Code のホーム画面には描けないので、セッションの横にダッシュボードのパネルを出す。
 // 中身：Claude の稼働状況（status.claude.com）、GitHub への最近のプッシュ（コミットメッセージ付き）、
@@ -284,6 +284,13 @@ async function collectRepoList($: Api, ownRepos: readonly RepoPushed[]): Promise
   }))
 }
 
+// ---- 読み込んでいるメモリ ----
+// /context の「Memory files」と同じ一覧（パス・どこのものか・トークン数）。計算は手元の見積もりで、通信はしない
+async function collectMemory($: Api): Promise<MemoryFile[]> {
+  const { context } = await $.session.usage({ breakdown: 'summary' })
+  return (context.breakdown?.memoryFiles ?? []).map(f => ({ path: f.path, type: f.type, tokens: f.tokens }))
+}
+
 async function toggleSection($: Api, id: string) {
   const next = await update($, collapsed, list => (list.includes(id) ? list.filter(x => x !== id) : [...list, id]))
   await $.store.set(COLLAPSED_KEY, next)
@@ -314,7 +321,9 @@ async function collectAll($: Api) {
     collectPushes($, ownRepos).catch(err => (errors.push(`GitHub：${err.message ?? err}`), [] as Push[])),
     collectRepoList($, ownRepos).catch(err => (errors.push(`README：${err.message ?? err}`), [] as RepoInfo[])),
   ])
-  const next: Dashboard = { updatedAt: Date.now(), status, repos, pushes, repoList, errors }
+  const memoryFiles = await collectMemory($).catch(err => (errors.push(`メモリ：${err.message ?? err}`), [] as MemoryFile[]))
+  const home = ((await $.env.get('HOME')) as string | undefined) ?? ''
+  const next: Dashboard = { updatedAt: Date.now(), status, repos, pushes, repoList, memoryFiles, home, errors }
   await update($, data, () => next)
 }
 
@@ -410,8 +419,31 @@ function reposSection(d: Dashboard): Section {
   return { id: 'repos', title: `リポジトリ（${d.repoList.length}）`, markdown: limit(out.join('\n')) }
 }
 
+const MEMORY_TYPE: Record<string, string> = {
+  Managed: '組織',
+  User: 'ユーザー全体',
+  Project: 'プロジェクト',
+  Local: 'ローカル',
+  AutoMem: '自動メモリ',
+}
+
+function tokenText(n: number) {
+  return n >= 1000 ? `${Math.round(n / 100) / 10}k` : `${n}`
+}
+
+// このセッションが読み込んでいる CLAUDE.md・ルール・自動メモリ。パスを押すとファイルが開く
+function memorySection(d: Dashboard): Section {
+  const out = d.memoryFiles.map(f => {
+    const shown = d.home !== '' && f.path.startsWith(d.home) ? `~${f.path.slice(d.home.length)}` : f.path
+    return `- ${MEMORY_TYPE[f.type] ?? esc(f.type)}　[${esc(shown)}](file://${encodeURI(f.path)})　${tokenText(f.tokens)} トークン`
+  })
+  if (out.length === 0) out.push('なし')
+  const total = d.memoryFiles.reduce((sum, f) => sum + f.tokens, 0)
+  return { id: 'memory', title: `読み込んでいるメモリ・CLAUDE.md（${d.memoryFiles.length}・${tokenText(total)} トークン）`, markdown: limit(out.join('\n')) }
+}
+
 export function sections(d: Dashboard): Section[] {
-  return [statusSection(d), pendingSection(d), pushesSection(d), reposSection(d)].filter(x => x !== null)
+  return [statusSection(d), pendingSection(d), pushesSection(d), reposSection(d), memorySection(d)].filter(x => x !== null)
 }
 
 export const register: Register = on => {
