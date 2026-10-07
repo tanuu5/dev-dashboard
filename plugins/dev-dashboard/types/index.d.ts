@@ -16,7 +16,7 @@ export type RepoState = {
 }
 export type Push = { id: string; repo: string; time: number; branch: string; count: number; messages: string[] }
 // GitHub のリポジトリ一覧の 1 行。title は README の最初の見出し（日本語名が入っていることが多い）
-export type RepoInfo = { fullName: string; url: string; pushedAt: number; isPrivate: boolean; isArchived: boolean; title: string | null }
+export type RepoInfo = { fullName: string; url: string; pushedAt: number; isPrivate: boolean; isArchived: boolean; language: string | null; title: string | null }
 // このセッションの文脈に入っているメモリ（CLAUDE.md・ルール・自動メモリ）。/context の一覧と同じ
 export type MemoryFile = { path: string; type: string; tokens: number }
 export type Dashboard = {

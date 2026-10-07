@@ -135,14 +135,14 @@ const LAG_WINDOW_MS = 6 * 60 * 60 * 1000
 const LAG_SLACK_MS = 30 * 1000
 
 // GitHub の自分のリポジトリ（最後にプッシュした順）。プッシュの補いとリポジトリの欄の両方で使う
-type RepoPushed = { name: string; pushedAt: string; branch: string; url: string; isPrivate: boolean; isArchived: boolean }
+type RepoPushed = { name: string; pushedAt: string; branch: string; url: string; isPrivate: boolean; isArchived: boolean; language: string | null }
 
 async function fetchOwnRepos($: Api): Promise<RepoPushed[]> {
   const out = await gh($, [
     'api',
     'user/repos?affiliation=owner&sort=pushed&per_page=100',
     '--jq',
-    '[.[] | {name: .full_name, pushedAt: .pushed_at, branch: .default_branch, url: .html_url, isPrivate: .private, isArchived: .archived}]',
+    '[.[] | {name: .full_name, pushedAt: .pushed_at, branch: .default_branch, url: .html_url, isPrivate: .private, isArchived: .archived, language: .language}]',
   ])
   if (out === null) throw new Error('リポジトリの一覧を取得できず')
   return JSON.parse(out) as RepoPushed[]
@@ -280,6 +280,7 @@ async function collectRepoList($: Api, ownRepos: readonly RepoPushed[]): Promise
     pushedAt: Date.parse(r.pushedAt),
     isPrivate: r.isPrivate,
     isArchived: r.isArchived,
+    language: r.language ?? null,
     title: cache[r.name]?.title ?? null,
   }))
 }
@@ -336,88 +337,11 @@ function ago(t: number) {
   return `${Math.round(h / 24)}日前`
 }
 
-const MARK: Record<string, string> = {
-  operational: '🟢',
-  degraded_performance: '🟡',
-  partial_outage: '🟠',
-  major_outage: '🔴',
-  under_maintenance: '🔧',
-}
-const INDICATOR: Record<string, string> = { none: '🟢', minor: '🟡', major: '🟠', critical: '🔴', maintenance: '🔧' }
-
 function esc(s: string) {
   return s.replace(/([\\`*_[\]|<>])/g, '\\$1')
 }
 
-// 畳めるセクション。見出しはボタン（▼／▶）、中身は Markdown
-type Section = { id: string; title: string; markdown: string }
-
 const limit = (text: string) => text.slice(0, 9800)
-
-function statusSection(d: Dashboard): Section {
-  const out: string[] = []
-  const s = d.status
-  if (s) {
-    out.push(`${INDICATOR[s.indicator] ?? '⚪'} **${esc(s.description)}**`)
-    out.push('')
-    out.push(s.components.map(c => `${MARK[c.status] ?? '⚪'} ${esc(c.name)}`).join('　'))
-    if (s.incidents.length > 0) {
-      out.push('')
-      for (const i of s.incidents.slice(0, 5)) {
-        out.push(`- [${esc(i.name)}](${i.url})（${i.status}・${ago(Date.parse(i.updatedAt))}）`)
-      }
-    }
-  } else {
-    out.push('取得できませんでした')
-  }
-  // 畳んでいても状態が分かるよう、見出しに印を付ける
-  return { id: 'status', title: `Claude の稼働状況　${s ? (INDICATOR[s.indicator] ?? '⚪') : '⚪'}`, markdown: limit(out.join('\n')) }
-}
-
-// 個人開発ではコミットとプッシュがほぼセットなので、プッシュ待ちはあるときだけ出す
-function pendingSection(d: Dashboard): Section | null {
-  const pending = d.repos
-    .filter(r => r.ahead > 0 || r.dirty > 0 || (r.hasRemote && !r.hasUpstream))
-    .sort((a, b) => b.ahead - a.ahead || b.dirty - a.dirty)
-  if (pending.length === 0) return null
-  const out: string[] = []
-  for (const r of pending.slice(0, 8)) {
-    const tags = [
-      r.ahead > 0 ? `⬆ ${r.ahead} 件未プッシュ` : '',
-      r.behind > 0 ? `⬇ ${r.behind}` : '',
-      r.dirty > 0 ? `✎ ${r.dirty} ファイル未コミット` : '',
-      r.hasRemote && !r.hasUpstream ? '上流ブランチなし' : '',
-    ].filter(Boolean)
-    out.push(`- **${esc(r.name)}** \`${esc(r.branch)}\`　${tags.join('・')}`)
-  }
-  return { id: 'pending', title: `プッシュ待ち・未コミット（${pending.length}）`, markdown: limit(out.join('\n')) }
-}
-
-function pushesSection(d: Dashboard): Section {
-  const out: string[] = []
-  if (d.pushes.length === 0) out.push('なし')
-  for (const p of d.pushes) {
-    const repo = p.repo.split('/').pop() ?? p.repo
-    const branch = p.branch === 'main' || p.branch === 'master' ? '' : `　\`${esc(p.branch)}\``
-    const count = p.count > 1 ? `　（${p.count} コミット）` : ''
-    out.push(`- ${ago(p.time)}　[**${esc(repo)}**](https://github.com/${p.repo})${branch}${count}`)
-    for (const m of p.messages.slice(0, MESSAGES_PER_PUSH)) out.push(`  - ${esc(m)}`)
-    if (p.messages.length > MESSAGES_PER_PUSH) out.push(`  - ほか ${p.messages.length - MESSAGES_PER_PUSH} 件`)
-  }
-  return { id: 'pushes', title: `最近のプッシュ（${d.pushes.length}）`, markdown: limit(out.join('\n')) }
-}
-
-// 自分のリポジトリ全部。最後にプッシュした順。名前を押すと GitHub のページが開く
-function reposSection(d: Dashboard): Section {
-  const out = d.repoList.map(r => {
-    const name = r.fullName.split('/').pop() ?? r.fullName
-    const title = r.title ? `　${esc(r.title)}` : ''
-    const marks = `${r.isPrivate ? '　🔒' : ''}${r.isArchived ? '　📦' : ''}`
-    return `- [**${esc(name)}**](${r.url})${title}${marks}　·　${ago(r.pushedAt)}`
-  })
-  if (out.length === 0) out.push('なし')
-  return { id: 'repos', title: `リポジトリ（${d.repoList.length}）`, markdown: limit(out.join('\n')) }
-}
 
 const MEMORY_TYPE: Record<string, string> = {
   Managed: '組織',
@@ -431,19 +355,233 @@ function tokenText(n: number) {
   return n >= 1000 ? `${Math.round(n / 100) / 10}k` : `${n}`
 }
 
-// このセッションが読み込んでいる CLAUDE.md・ルール・自動メモリ。パスを押すとファイルが開く
-function memorySection(d: Dashboard): Section {
+// このセッションが読み込んでいる CLAUDE.md・ルール・自動メモリ。パスを押すとファイルが開く。
+// ファイルへのリンク（file://）は Link では描けないので、この欄だけ Markdown で書く
+export function memoryMarkdown(d: Dashboard): string {
   const out = d.memoryFiles.map(f => {
     const shown = d.home !== '' && f.path.startsWith(d.home) ? `~${f.path.slice(d.home.length)}` : f.path
     return `- ${MEMORY_TYPE[f.type] ?? esc(f.type)}　[${esc(shown)}](file://${encodeURI(f.path)})　${tokenText(f.tokens)} トークン`
   })
   if (out.length === 0) out.push('なし')
-  const total = d.memoryFiles.reduce((sum, f) => sum + f.tokens, 0)
-  return { id: 'memory', title: `読み込んでいるメモリ・CLAUDE.md（${d.memoryFiles.length}・${tokenText(total)} トークン）`, markdown: limit(out.join('\n')) }
+  return limit(out.join('\n'))
 }
 
-export function sections(d: Dashboard): Section[] {
-  return [statusSection(d), pendingSection(d), pushesSection(d), reposSection(d), memorySection(d)].filter(x => x !== null)
+// ---- カード型の表示 ----
+// 枠（角丸）と色で区切ったカードを縦に並べる。色はテーマの名前（success・warning など）で書き、ライトとダークの両方に合わせる。
+// 大きさの単位は文字のマス。
+
+type UI = { Box: any; Text: any; Button: any; Link: any; Markdown: any }
+
+const TONE: Record<string, string> = { none: 'success', minor: 'warning', major: 'error', critical: 'error', maintenance: 'suggestion' }
+const COMPONENT_TONE: Record<string, string> = {
+  operational: 'success',
+  degraded_performance: 'warning',
+  partial_outage: 'warning',
+  major_outage: 'error',
+  under_maintenance: 'suggestion',
+}
+const COMPONENT_TEXT: Record<string, string> = {
+  operational: '稼働中',
+  degraded_performance: '性能低下',
+  partial_outage: '一部停止',
+  major_outage: '停止',
+  under_maintenance: 'メンテナンス中',
+}
+const INCIDENT_TEXT: Record<string, string> = {
+  investigating: '調査中',
+  identified: '原因特定',
+  monitoring: '経過観察',
+  resolved: '解決',
+  in_progress: '実施中',
+  scheduled: '予定',
+}
+// GitHub の言語の色（linguist）。無い言語は灰色
+const LANGUAGE_COLOR: Record<string, string> = {
+  TypeScript: '#3178C6',
+  JavaScript: '#F1E05A',
+  HTML: '#E34C26',
+  CSS: '#663399',
+  Python: '#3572A5',
+  Swift: '#F05138',
+  Shell: '#89E051',
+  GDScript: '#355570',
+  Rust: '#DEA584',
+  Go: '#00ADD8',
+}
+// リポジトリを 2 列に並べる幅（マス）
+const TWO_COLUMNS_FROM = 90
+
+export type PendingSummary = { total: number; unpushed: number; uncommitted: number; repos: RepoState[] }
+
+export function pendingSummary(repos: readonly RepoState[]): PendingSummary {
+  const list = repos
+    .filter(r => r.ahead > 0 || r.dirty > 0 || (r.hasRemote && !r.hasUpstream))
+    .sort((a, b) => b.ahead - a.ahead || b.dirty - a.dirty)
+  return {
+    total: list.length,
+    unpushed: list.filter(r => r.ahead > 0 || (r.hasRemote && !r.hasUpstream)).length,
+    uncommitted: list.filter(r => r.dirty > 0).length,
+    repos: list,
+  }
+}
+
+// summary は畳んでいるときだけ見出しの横に出す（畳んでいても様子が分かるように）
+function card(ui: UI, id: string, title: string, folded: boolean, onToggle: () => void, body: unknown, opts: { tone?: string; right?: unknown; summary?: unknown } = {}) {
+  const { Box, Button } = ui
+  return (
+    <Box key={id} flexDirection="column" borderStyle="round" borderColor={opts.tone ?? 'inactive'} paddingX={1} marginTop={1}>
+      <Box key="head" flexDirection="row" justifyContent="space-between">
+        <Box key="title" flexDirection="row" columnGap={1} flexShrink={1}>
+          <Button key={`toggle-${id}`} label={`${folded ? '▶' : '▼'} ${title}`} plain onPress={onToggle} />
+          {folded ? (opts.summary ?? null) : null}
+        </Box>
+        {opts.right ?? null}
+      </Box>
+      {folded ? null : body}
+    </Box>
+  )
+}
+
+function statusBody(ui: UI, s: ServiceStatus | null) {
+  const { Box, Text, Link } = ui
+  if (!s) return <Text dimColor>取得できませんでした</Text>
+  const tone = TONE[s.indicator] ?? 'inactive'
+  return (
+    <Box flexDirection="column">
+      <Text key="desc" color={tone} bold>
+        {s.indicator === 'none' ? '✓ ' : '⚠ '}
+        {s.description}
+      </Text>
+      <Box key="chips" flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1}>
+        {s.components.map(c => (
+          <Box key={`c-${c.name}`} borderStyle="round" borderColor="inactive" paddingX={1} flexDirection="row">
+            <Text color={COMPONENT_TONE[c.status] ?? 'inactive'}>● </Text>
+            <Text bold>{c.name} </Text>
+            <Text color={COMPONENT_TONE[c.status] ?? 'inactive'}>{COMPONENT_TEXT[c.status] ?? c.status}</Text>
+          </Box>
+        ))}
+      </Box>
+      {s.incidents.slice(0, 5).map(i => (
+        <Box key={`i-${i.url}`} borderStyle="round" borderColor="suggestion" paddingX={1} flexDirection="row" justifyContent="space-between" columnGap={2}>
+          <Box key="name" flexDirection="row" flexShrink={1}>
+            <Text color="suggestion">ⓘ </Text>
+            <Link href={i.url} label={i.name} />
+          </Box>
+          <Text key="when" dimColor>
+            {INCIDENT_TEXT[i.status] ?? i.status}・{ago(Date.parse(i.updatedAt))}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+// 畳んだ見出しの横の一言：全体の状態と、障害の件数
+function statusSummary(ui: UI, s: ServiceStatus | null) {
+  const { Text } = ui
+  if (!s) return <Text dimColor>取得できず</Text>
+  const tone = TONE[s.indicator] ?? 'inactive'
+  const count = s.incidents.length > 0 ? `（${s.incidents.length} 件）` : ''
+  return (
+    <Text color={tone} bold>
+      {s.indicator === 'none' ? '✓ 正常' : `⚠ ${s.description}${count}`}
+    </Text>
+  )
+}
+
+function pendingBody(ui: UI, p: PendingSummary) {
+  const { Box, Text } = ui
+  if (p.total === 0) return <Text color="success">✓ すべてコミット・プッシュ済み</Text>
+  return (
+    <Box flexDirection="column">
+      <Box key="counts" flexDirection="row" columnGap={1} flexWrap="wrap">
+        <Box key="unpushed" borderStyle="round" borderColor="inactive" paddingX={1} flexDirection="row">
+          <Text>⬆ プッシュ待ち </Text>
+          <Text bold color={p.unpushed > 0 ? 'warning' : undefined}>{p.unpushed}</Text>
+        </Box>
+        <Box key="uncommitted" borderStyle="round" borderColor="inactive" paddingX={1} flexDirection="row">
+          <Text>✎ 未コミット </Text>
+          <Text bold color={p.uncommitted > 0 ? 'warning' : undefined}>{p.uncommitted}</Text>
+        </Box>
+      </Box>
+      {p.repos.slice(0, 8).map(r => (
+        <Box key={`r-${r.name}`} flexDirection="row" columnGap={1} flexWrap="wrap">
+          <Text bold>{r.name}</Text>
+          <Text dimColor>{r.branch}</Text>
+          {r.ahead > 0 ? <Text color="warning">⬆{r.ahead}</Text> : null}
+          {r.behind > 0 ? <Text dimColor>⬇{r.behind}</Text> : null}
+          {r.dirty > 0 ? <Text color="warning">✎{r.dirty}</Text> : null}
+          {r.hasRemote && !r.hasUpstream ? <Text dimColor>上流なし</Text> : null}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+function pushesBody(ui: UI, pushes: readonly Push[]) {
+  const { Box, Text, Link } = ui
+  if (pushes.length === 0) return <Text dimColor>なし</Text>
+  return (
+    <Box flexDirection="column">
+      {pushes.map((p, n) => {
+        const repo = p.repo.split('/').pop() ?? p.repo
+        const extra = [p.branch === 'main' || p.branch === 'master' ? '' : p.branch, p.count > 1 ? `${p.count} コミット` : ''].filter(Boolean).join('・')
+        return (
+          <Box key={`p-${p.id}`} flexDirection="row" columnGap={1} marginTop={n === 0 ? 0 : 1}>
+            <Box key="when" width={8} flexShrink={0}>
+              <Text dimColor>{ago(p.time)}</Text>
+            </Box>
+            <Box key="what" flexDirection="column" flexGrow={1} flexShrink={1}>
+              <Box key="repo" flexDirection="row" columnGap={1}>
+                <Link href={`https://github.com/${p.repo}`} label={repo} />
+                {extra ? <Text dimColor>{extra}</Text> : null}
+              </Box>
+              {p.messages.slice(0, MESSAGES_PER_PUSH).map((m, k) => (
+                <Text key={`m-${k}`}>{m}</Text>
+              ))}
+              {p.messages.length > MESSAGES_PER_PUSH ? <Text dimColor>ほか {p.messages.length - MESSAGES_PER_PUSH} 件</Text> : null}
+            </Box>
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
+function reposBody(ui: UI, repos: readonly RepoInfo[], columns: number) {
+  const { Box, Text, Link } = ui
+  if (repos.length === 0) return <Text dimColor>なし</Text>
+  const width = columns >= TWO_COLUMNS_FROM ? '50%' : '100%'
+  return (
+    <Box flexDirection="row" flexWrap="wrap">
+      {repos.map(r => {
+        const name = r.fullName.split('/').pop() ?? r.fullName
+        return (
+          <Box key={`g-${r.fullName}`} width={width} paddingRight={1}>
+            <Box key="tile" flexGrow={1} borderStyle="round" borderColor="inactive" paddingX={1} flexDirection="row" columnGap={1}>
+              <Text key="dot" color={(r.language && LANGUAGE_COLOR[r.language]) ?? 'inactive'}>●</Text>
+              <Box key="text" flexDirection="column" flexGrow={1} flexShrink={1}>
+                <Box key="name" flexDirection="row" columnGap={1}>
+                  <Link href={r.url} label={name} />
+                  {r.isPrivate ? <Text>🔒</Text> : null}
+                  {r.isArchived ? <Text>📦</Text> : null}
+                </Box>
+                <Text key="title" dimColor wrap="truncate-end">
+                  {r.title ?? r.language ?? '·'}
+                </Text>
+              </Box>
+              <Text key="ago" dimColor>{ago(r.pushedAt)}</Text>
+            </Box>
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
+function memoryBody(ui: UI, d: Dashboard) {
+  const { Markdown } = ui
+  return <Markdown text={memoryMarkdown(d)} />
 }
 
 export const register: Register = on => {
@@ -484,30 +622,40 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Markdown } = $.ui.resolve(e)
+    const ui = $.ui.resolve(e) as unknown as UI
+    const { Box, Text, Button, Link, Markdown } = ui
     const d = await read($, data)
     const loading = await read($, isLoading)
     const folded = await read($, collapsed)
+    const toggle = (id: string) => () => void toggleSection($, id)
+    const pending = d === null ? null : pendingSummary(d.repos)
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" justifyContent="space-between">
-          <Text dimColor>{loading ? '更新中…' : d ? `${ago(d.updatedAt)}に更新` : ''}</Text>
+        <Box key="top" flexDirection="row" justifyContent="space-between">
+          <Text dimColor>{loading ? '更新中…' : d ? `最終更新：${ago(d.updatedAt)}` : ''}</Text>
           <Button label="更新" hotkey="r" onPress={() => void refresh($)} />
         </Box>
         {d === null ? <Text dimColor>読み込み中…</Text> : null}
-        {(d === null ? [] : sections(d)).map(sec => (
-          <Box key={sec.id} flexDirection="column" marginTop={1}>
-            <Box key="head" flexDirection="row">
-              <Button
-                key={`toggle-${sec.id}`}
-                label={`${folded.includes(sec.id) ? '▶' : '▼'} ${sec.title}`}
-                plain
-                onPress={() => void toggleSection($, sec.id)}
-              />
-            </Box>
-            {folded.includes(sec.id) ? null : <Markdown key={`md-${sec.id}`} text={sec.markdown} />}
-          </Box>
-        ))}
+        {d === null || pending === null
+          ? null
+          : [
+              card(ui, 'status', 'Claude の稼働状況', folded.includes('status'), toggle('status'), statusBody(ui, d.status), {
+                tone: d.status ? TONE[d.status.indicator] : undefined,
+                right: <Link href="https://status.claude.com" label="ステータスページ ↗" />,
+                summary: statusSummary(ui, d.status),
+              }),
+              card(ui, 'pending', `プッシュ待ち・未コミット（${pending.total}）`, folded.includes('pending'), toggle('pending'), pendingBody(ui, pending)),
+              card(ui, 'pushes', `最近のプッシュ（${d.pushes.length}）`, folded.includes('pushes'), toggle('pushes'), pushesBody(ui, d.pushes)),
+              card(ui, 'repos', `リポジトリ（${d.repoList.length}）`, folded.includes('repos'), toggle('repos'), reposBody(ui, d.repoList, e.props.bodyColumns)),
+              card(
+                ui,
+                'memory',
+                `読み込んでいるメモリ・CLAUDE.md（${d.memoryFiles.length}・${tokenText(d.memoryFiles.reduce((sum, f) => sum + f.tokens, 0))} トークン）`,
+                folded.includes('memory'),
+                toggle('memory'),
+                memoryBody(ui, d),
+              ),
+            ]}
         {d !== null && d.errors.length > 0 ? <Markdown key="errors" text={limit(d.errors.map(e => `> ⚠ ${esc(e)}`).join('\n'))} /> : null}
       </Box>
     )

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { readmeTitle, sections, unreportedCommits } from '../hooks/register'
+import { memoryMarkdown, readmeTitle, unreportedCommits } from '../hooks/register'
 
 const commit = (sha: string, date: string) => ({ sha, date, message: `msg ${sha}` })
 
@@ -34,38 +34,6 @@ describe('README の見出しを名前に添える', () => {
   })
 })
 
-describe('畳めるセクション', () => {
-  const dashboard = {
-    updatedAt: 0,
-    status: { indicator: 'none', description: 'All Systems Operational', components: [], incidents: [] },
-    repos: [],
-    pushes: [],
-    repoList: [
-      { fullName: 'tanuu5/shippo-express', url: 'https://github.com/tanuu5/shippo-express', pushedAt: 0, isPrivate: false, isArchived: false, title: 'しっぽ急便 — TAIL EXPRESS' },
-      { fullName: 'tanuu5/reel', url: 'https://github.com/tanuu5/reel', pushedAt: 0, isPrivate: true, isArchived: false, title: null },
-    ],
-    memoryFiles: [
-      { path: '/home/me/.claude/CLAUDE.md', type: 'User', tokens: 1_840 },
-      { path: '/home/me/.claude/projects/x/memory/MEMORY.md', type: 'AutoMem', tokens: 310 },
-    ],
-    home: '/home/me',
-    errors: [],
-  }
-
-  test('稼働状況・最近のプッシュ・リポジトリ・メモリの順に並び、プッシュ待ちが無ければ出さない', async () => {
-    const list = sections(dashboard)
-    expect(list.map(s => s.id)).toEqual(['status', 'pushes', 'repos', 'memory'])
-    expect(list[0]!.title).toBe('Claude の稼働状況　🟢')
-    expect(list[2]!.title).toBe('リポジトリ（2）')
-  })
-
-  test('リポジトリは GitHub へのリンクと日本語名、非公開の印を出す', async () => {
-    const md = sections(dashboard)[2]!.markdown
-    expect(md).toContain('[**shippo-express**](https://github.com/tanuu5/shippo-express)　しっぽ急便 — TAIL EXPRESS')
-    expect(md).toContain('[**reel**](https://github.com/tanuu5/reel)　🔒')
-  })
-})
-
 describe('読み込んでいるメモリ', () => {
   test('どこのものか、~ で縮めたパス（ファイルへのリンク）、トークン数を出す', async () => {
     const d = {
@@ -75,9 +43,8 @@ describe('読み込んでいるメモリ', () => {
         { path: '/home/me/.claude/projects/x/memory/MEMORY.md', type: 'AutoMem', tokens: 310 },
       ],
     }
-    const memory = sections(d).find(s => s.id === 'memory')!
-    expect(memory.title).toBe('読み込んでいるメモリ・CLAUDE.md（2・2.2k トークン）')
-    expect(memory.markdown).toContain('- ユーザー全体　[~/.claude/CLAUDE.md](file:///home/me/.claude/CLAUDE.md)　1.8k トークン')
-    expect(memory.markdown).toContain('- 自動メモリ　[~/.claude/projects/x/memory/MEMORY.md]')
+    const md = memoryMarkdown(d)
+    expect(md).toContain('- ユーザー全体　[~/.claude/CLAUDE.md](file:///home/me/.claude/CLAUDE.md)　1.8k トークン')
+    expect(md).toContain('- 自動メモリ　[~/.claude/projects/x/memory/MEMORY.md]')
   })
 })
